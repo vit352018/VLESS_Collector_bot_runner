@@ -1,1 +1,70 @@
+name: 🔄 Collect & Test VPN Configs
 
+on:
+  schedule:
+    - cron: "0 * * * *"   # каждый час, ровно в 00 минут
+  workflow_dispatch:        # кнопка ручного запуска в GitHub
+
+permissions:
+  contents: write           # нужно чтобы бот мог делать git commit
+
+jobs:
+  collect:
+    name: Сбор → Тест → Яндекс Диск → Коммит
+    runs-on: ubuntu-latest
+    timeout-minutes: 25     # если что-то зависло — прервать через 25 мин
+
+    steps:
+
+      # Шаг 1: скачиваем наш репозиторий на сервер GitHub
+      - name: 📥 Скачать репозиторий
+        uses: actions/checkout@v4
+
+      # Шаг 2: устанавливаем Python
+      - name: 🐍 Установить Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Шаг 3: устанавливаем нужные библиотеки
+      - name: 📦 Установить зависимости
+        run: pip install -r requirements.txt
+
+      # Шаг 4: запускаем коллектор
+      # YANDEX_LOGIN и YANDEX_PASS берутся из зашифрованных секретов GitHub.
+      # Если секреты не заданы — загрузка на Яндекс Диск просто пропустится.
+      - name: 🚀 Запустить коллектор
+        env:
+          PYTHONUNBUFFERED: "1"
+          YANDEX_LOGIN: ${{ secrets.YANDEX_LOGIN }}
+          YANDEX_PASS:  ${{ secrets.YANDEX_PASS }}
+        run: python src/main.py
+
+      # Шаг 5: показываем что получилось (первые 10 строк файла)
+      - name: 📊 Итог
+        run: |
+          echo "=== Первые 10 строк VLESS_WORKING.txt ==="
+          head -10 output/VLESS_WORKING.txt || echo "(файл не создан)"
+          echo ""
+          echo "=== Статистика ==="
+          cat output/stats.json 2>/dev/null | python3 -c "
+          import json,sys
+          s = json.load(sys.stdin)
+          print(f'Рабочих серверов: {s[\"total_working\"]}')
+          print(f'TLS подтверждено: {s[\"tls_confirmed\"]}')
+          print(f'По протоколам: {s[\"by_protocol\"]}')
+          " || echo "(stats.json не найден)"
+
+      # Шаг 6: сохраняем результат в репозиторий
+      # Благодаря этому файлы доступны по raw.githubusercontent.com ссылке
+      - name: 💾 Сохранить результат в репозиторий
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          # Делаем коммит только если файлы изменились
+          git diff --cached --quiet \
+            && echo "Файлы не изменились, коммит не нужен" \
+            || git commit -m "⚡ Обновление $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push

@@ -26,17 +26,54 @@ import config as _cfg
 # ── Настройки ──────────────────────────────────────────────────────────────────
 
 SOURCES: list[dict] = [
-    # GitHub-репозитории (raw-ссылки на txt/yaml с конфигами)
+
+    # ── Специализированные источники для РФ (обход ТСПУ/РКН) ─────────────────
+    # Эти источники помечены ru=True — из них берутся серверы для RU_BYPASS.txt
+
     {
-        "name": "igareck/vpn-configs-for-russia BLACK_VLESS",
+        "name": "igareck BLACK_VLESS_RUS",
         "url": "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
         "type": "raw",
+        "ru": True,   # ← специально для РФ
     },
     {
-        "name": "igareck/vpn-configs-for-russia WHITE_VLESS",
+        "name": "igareck WHITE_VLESS_RUS",
         "url": "https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE_VLESS_RUS.txt",
         "type": "raw",
+        "ru": True,
     },
+    {
+        "name": "igareck VLESS_REALITY_RUS",
+        "url": "https://raw.githack.com/igareck/vpn-configs-for-russia/main/VLESS_REALITY_RUS.txt",
+        "type": "raw",
+        "ru": True,
+    },
+    {
+        "name": "soroushmirzaei reality configs",
+        "url": "https://raw.githubusercontent.com/soroushmirzaei/telegram-configs-collector/main/splitted/reality",
+        "type": "raw",
+        "ru": True,
+    },
+    {
+        "name": "XTLS/Xray reality subscription",
+        "url": "https://raw.githubusercontent.com/yebekhe/TelegramV2rayCollector/main/sub/reality",
+        "type": "raw",
+        "ru": True,
+    },
+    {
+        "name": "MatinGhanbari/FreeVlessReality",
+        "url": "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/xray/sub10.txt",
+        "type": "raw",
+        "ru": True,
+    },
+    {
+        "name": "Everyday-VPN russia",
+        "url": "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/reality",
+        "type": "raw",
+        "ru": True,
+    },
+
+    # ── Общие источники (все протоколы) ───────────────────────────────────────
     {
         "name": "mahdibland/V2RayAggregator",
         "url": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/Eternity",
@@ -81,6 +118,34 @@ SOURCES: list[dict] = [
 
 # Протоколы, которые собираем
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "tuic://")
+
+# Множество URL источников помеченных ru=True — для фильтрации RU_BYPASS
+RU_SOURCE_URLS: set[str] = {s["url"] for s in SOURCES if s.get("ru")}
+
+
+def is_russia_bypass(config_str: str) -> bool:
+    """
+    Определяет, подходит ли конфиг для обхода российских блокировок (ТСПУ/РКН).
+
+    Простыми словами:
+      ТСПУ умеет распознавать обычный VPN.
+      Единственный надёжный способ обойти его — VLESS + XTLS Reality.
+      Сервер притворяется обычным HTTPS-сайтом (например, github.com).
+      DPI видит обычный TLS и пропускает трафик.
+
+      Признаки Reality-конфига:
+        security=reality        — главный признак
+        flow=xtls-rprx-vision   — XTLS Vision (лучший вариант для РФ)
+        pbk=...                 — публичный ключ (есть только у Reality)
+    """
+    if not config_str.lower().startswith("vless://"):
+        return False
+    low = config_str.lower()
+    if "security=reality" in low:   return True
+    if "flow=xtls-rprx-vision" in low: return True
+    if "&pbk=" in low or "?pbk=" in low: return True
+    return False
+
 
 # Параметры тестирования
 TCP_TIMEOUT   = 5.0    # секунд на одну проверку
@@ -187,41 +252,100 @@ async def tcp_check(host: str, port: int, timeout: float = TCP_TIMEOUT) -> Optio
 
 # ── Сбор из источников ─────────────────────────────────────────────────────────
 
-async def fetch_source(session: aiohttp.ClientSession, source: dict) -> list[str]:
-    """Скачать один источник и вернуть список конфигов."""
+async def fetch_source_with_retry(
+    session: aiohttp.ClientSession,
+    source: dict,
+    retries: int = 2,
+) -> list[str]:
+    """
+    Скачивает один источник, при ошибке повторяет до 2 раз.
+
+    Простыми словами: если сайт не ответил — подождём 3 секунды
+    и попробуем ещё раз. Иногда серверы просто временно перегружены.
+    """
     url  = source["url"]
     fmt  = source.get("type", "raw")
     name = source["name"]
+
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
+            ) as resp:
+                if resp.status == 404:
+                    log.warning("  %-45s  404 — источник не найден", name)
+                    return []  # повтор не поможет
+                if resp.status != 200:
+                    log.warning("  %-45s  HTTP %s (попытка %d)", name, resp.status, attempt + 1)
+                    if attempt < retries:
+                        await asyncio.sleep(3)
+                        continue
+                    return []
+                raw = await resp.text(errors="ignore")
+
+            decoded = decode_source(raw, fmt)
+            configs = extract_configs(decoded)
+            log.info("  %-45s  %d конфигов", name, len(configs))
+            return configs
+
+        except asyncio.TimeoutError:
+            log.warning("  %-45s  таймаут (попытка %d)", name, attempt + 1)
+        except Exception as e:
+            log.warning("  %-45s  ошибка: %s (попытка %d)", name, e, attempt + 1)
+
+        if attempt < retries:
+            await asyncio.sleep(3)
+
+    return []
+
+
+async def collect_all() -> tuple[list[str], set[str]]:
+    """
+    Скачивает конфиги из всех источников параллельно.
+    Автоматически подхватывает источники найденные source_discovery.
+
+    Возвращает:
+      (unique_configs, ru_candidate_keys)
+      ru_candidate_keys — ключи конфигов из RU-источников (для RU_BYPASS.txt)
+    """
+    # Основные встроенные источники
+    all_sources = list(SOURCES)
+
+    # Добавляем автоматически найденные (если есть)
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT)) as resp:
-            if resp.status != 200:
-                log.warning("  %-45s  HTTP %s", name, resp.status)
-                return []
-            raw = await resp.text(errors="ignore")
-        decoded = decode_source(raw, fmt)
-        configs = extract_configs(decoded)
-        log.info("  %-45s  %d конфигов", name, len(configs))
-        return configs
+        from source_discovery import load_discovered
+        discovered = load_discovered()
+        if discovered:
+            log.info("  📡 Автообнаружено источников: %d", len(discovered))
+            existing_urls = {s["url"] for s in all_sources}
+            for s in discovered:
+                if s["url"] not in existing_urls:
+                    all_sources.append(s)
     except Exception as e:
-        log.warning("  %-45s  ошибка: %s", name, e)
-        return []
+        log.debug("source_discovery не доступен: %s", e)
 
-
-async def collect_all() -> list[str]:
-    """Скачать все источники параллельно."""
-    log.info("📥 Скачиваю источники (%d)…", len(SOURCES))
+    log.info("📥 Скачиваю %d источников…", len(all_sources))
     connector = aiohttp.TCPConnector(ssl=False, limit=20)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; VPNCollector/1.0)"}
+    headers   = {"User-Agent": "Mozilla/5.0 (compatible; VPNCollector/1.0)"}
+
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        tasks = [fetch_source(session, src) for src in SOURCES]
+        tasks   = [fetch_source_with_retry(session, src) for src in all_sources]
         results = await asyncio.gather(*tasks)
 
     all_configs: list[str] = []
-    for batch in results:
-        all_configs.extend(batch)
+    # Запоминаем ключи конфигов из RU-источников
+    ru_keys: set[str] = set()
 
-    # Дедупликация по «телу» без метки (#...)
-    seen: set[str] = set()
+    for source, batch in zip(all_sources, results):
+        is_ru_source = source.get("ru", False)
+        for c in batch:
+            all_configs.append(c)
+            if is_ru_source:
+                ru_keys.add(c.split("#")[0].rstrip("?& "))
+
+    # Дедупликация
+    seen:   set[str]  = set()
     unique: list[str] = []
     for c in all_configs:
         key = c.split("#")[0].rstrip("?& ")
@@ -229,8 +353,8 @@ async def collect_all() -> list[str]:
             seen.add(key)
             unique.append(c)
 
-    log.info("📦 Всего уникальных конфигов: %d", len(unique))
-    return unique
+    log.info("📦 Уникальных: %d  из них RU-источники: %d", len(unique), len(ru_keys))
+    return unique, ru_keys
 
 
 # ── Тестирование ───────────────────────────────────────────────────────────────
